@@ -43,7 +43,7 @@ public:
 
     void updateMotion(const ros::TimerEvent &);
 
-    void updateMeas();
+    void updateMeas(const ros::TimerEvent &);
 
 private:
     std::string node_name_;
@@ -80,6 +80,7 @@ private:
     void throttleCB(const std_msgs::Float64ConstPtr& throttle_msg);
     void inclinationCB(const std_msgs::Float64ConstPtr& inclination_msg);
 
+    int beams_num_;
 };
 
 

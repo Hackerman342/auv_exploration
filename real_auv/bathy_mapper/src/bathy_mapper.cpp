@@ -12,7 +12,7 @@ BathyMapper::BathyMapper(ros::NodeHandle& nh, ros::NodeHandle& nh_priv)
     : nh_(nh)
     , nh_priv_(nh_priv)
     , map_pub_(nh_priv.advertise<ufomap_msgs::Ufomap>(
-                "map", nh_priv.param("map_queue_size", 10), nh_priv.param("map_latch", false)))
+                "map", nh_priv.param("map_queue_size", 10), nh_priv.param("map_latch", true)))
     , map_binary_pub_(nh_priv.advertise<ufomap_msgs::Ufomap>(
                 "map_binary", nh_priv.param("map_binary_queue_size", 10),
                 nh_priv.param("map_binary_latch", false)))
@@ -39,7 +39,6 @@ BathyMapper::BathyMapper(ros::NodeHandle& nh, ros::NodeHandle& nh_priv)
     nh_priv_.param<std::string>("mbes_link", mbes_frame_, "mbes_link");
     nh_priv_.param<std::string>("map_pcl", map_top, "/map");
     nh_priv_.param<float>("mbes_open_angle", spam_, 1.5708);
-    nh_priv_.param<float>("num_beams_sim", n_beams_, 100);
     nh_priv_.param<std::string>("map_cereal", map_str, "map.cereal");
     nh_priv_.param<std::string>("mbes_sim_as", mbes_sim_as, "mbes_sim_action");
 
@@ -66,6 +65,7 @@ BathyMapper::BathyMapper(ros::NodeHandle& nh, ros::NodeHandle& nh_priv)
 }
 
 BathyMapper::~BathyMapper(){
+    ROS_INFO("Saving map");
     if(!out_map_file_.empty()){
         this->saveMap(out_map_file_);
     }
@@ -94,11 +94,12 @@ void BathyMapper::simulateMBES(const auv_2_ros::MbesSimGoalConstPtr &mbes_goal){
                                     sensor_tf.translation().z());
     sensor_orientation_ = sensor_tf.linear();
 
-    beam_directions_.reserve(n_beams_);
-    float roll_step = spam_/n_beams_;
+    int n_beams = mbes_goal->beams_num.data;
+    beam_directions_.reserve(n_beams);
+    float roll_step = spam_/n_beams;
     Eigen::Quaterniond q;
     Eigen::Matrix3d rot_beam;
-    for(int i = -n_beams_/2; i<=n_beams_/2; i++){
+    for(int i = -n_beams/2; i<=n_beams/2; i++){
         q = Eigen::AngleAxisd(roll_step*i, Eigen::Vector3d::UnitX());
         rot_beam = (sensor_orientation_ * q).normalized().toRotationMatrix();
         beam_directions_.emplace_back(rot_beam.col(2).x(),rot_beam.col(2).y(),rot_beam.col(2).z());
@@ -110,8 +111,11 @@ void BathyMapper::simulateMBES(const auv_2_ros::MbesSimGoalConstPtr &mbes_goal){
     cloud.reserve(beam_directions_.size() / 4);
     for(ufomap::Point3& beam_i: beam_directions_){
         // TODO: fill up beams that don't hit occupied space with sth
-        if(map_.castRay(sensor_origin_, beam_i, *end, true, -1, 0)){
+        if(map_.castRay(sensor_origin_, beam_i, *end, true, 50, 0)){
             cloud.push_back(*end);
+        }
+        else{
+            cloud.push_back(ufomap::Point3(0,0,0));
         }
     }
     delete end;
@@ -127,6 +131,7 @@ void BathyMapper::simulateMBES(const auv_2_ros::MbesSimGoalConstPtr &mbes_goal){
         ufomap::fromUfomap(cloud, sim_ping);
         sim_ping->header.frame_id = mbes_goal->mbes_pose.header.frame_id;
         sim_ping->header.stamp = mbes_goal->mbes_pose.header.stamp;
+        sim_ping->header.seq = mbes_goal->mbes_pose.header.seq;
         result_.sim_mbes = *sim_ping;
         as_->setSucceeded(result_);
 
@@ -237,6 +242,7 @@ void BathyMapper::configCallback(bathy_mapper::ServerConfig& config, uint32_t le
     if (pub_rate_ != config.pub_rate)
     {
         pub_rate_ = config.pub_rate;
+        pub_rate_ = 0.1;
         if (0 < pub_rate_)
         {
             pub_timer_ =
@@ -255,8 +261,7 @@ void BathyMapper::configCallback(bathy_mapper::ServerConfig& config, uint32_t le
     if (map_pub_.isLatched() != config.map_latch ||
             map_queue_size_ != config.map_queue_size)
     {
-        map_pub_ = nh_priv_.advertise<ufomap_msgs::Ufomap>("map", config.map_queue_size,
-                                                                                                             config.map_latch);
+        map_pub_ = nh_priv_.advertise<ufomap_msgs::Ufomap>("map", config.map_queue_size, config.map_latch);
     }
 
     if (map_binary_pub_.isLatched() != config.map_binary_latch ||
