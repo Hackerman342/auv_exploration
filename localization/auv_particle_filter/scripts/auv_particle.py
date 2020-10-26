@@ -23,6 +23,10 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 from sensor_msgs import point_cloud2
 
+# For the gp weight
+from pf_gps_class import GP_mbes as GP
+import time
+
 
 class Particle(object):
     def __init__(self, beams_num, p_num, index, mbes_tf_matrix, m2o_matrix,
@@ -116,7 +120,8 @@ class Particle(object):
                 #  print (exp_mbes_ranges - mbes_meas_sampled)
 
                 # Update particle weights
-                self.w = self.weight_mv(mbes_meas_sampled, exp_mbes_ranges)
+                self.w = self.weight_gps(mbes_meas_sampled, exp_mbes_ranges)
+                # self.w = self.weight_mv(mbes_meas_sampled, exp_mbes_ranges)
                 #  print "MV ", self.w
                 #  self.w = self.weight_avg(mbes_meas_sampled, exp_mbes_ranges)
                 #  print "Avg ", self.w
@@ -139,7 +144,29 @@ class Particle(object):
             rospy.logwarn("missing pings!")
             w_i = 1.e-50
         return w_i
-        
+
+    def weight_gps(self, mbes_meas_ranges, mbes_sim_ranges):
+        time_start = time.time()
+        tmp_Ping = GP(mbes_meas_ranges, mbes_sim_ranges) # Create a gp object
+        # Getting training data
+        tmp_Ping.Training_data()
+        # Run gpytorch regression on real data
+        train_mbes_start = time.time()
+        tmp_Ping.test_x_mbes, tmp_Ping.observed_pred_mbes = tmp_Ping.run_gpytorch_regression(tmp_Ping.train_x_mbes, tmp_Ping.train_y_mbes)
+        print("\n MBES train time (s): ", time.time() - train_mbes_start, "\n")
+        # Run gpytorch regression on sim data
+        train_sim_start = time.time()
+        tmp_Ping.test_x_sim, tmp_Ping.observed_pred_sim = tmp_Ping.run_gpytorch_regression(tmp_Ping.train_x_sim, tmp_Ping.train_y_sim)
+        print("\n sim train time (s): ", time.time() - train_sim_start, "\n")
+        # Calculate KL divergence
+        w_i = tmp_Ping.KLgp_div()
+        print("\n Total ping time (s): ", time.time() - time_start, "\n")
+        print('\n gp weight: {}'.format(w_i, precision=3))
+
+        return w_i
+
+
+
     def weight_mv(self, mbes_meas_ranges, mbes_sim_ranges ):
         if len(mbes_meas_ranges) == len(mbes_sim_ranges):
             w_i = multivariate_normal.pdf(mbes_sim_ranges, mean=mbes_meas_ranges,
