@@ -33,6 +33,9 @@ from auvlib.data_tools import csv_data
 
 from scipy.ndimage.filters import gaussian_filter
 
+# gpytorch
+from bathy_gps import process, gp
+
 class auv_pf(object):
 
     def __init__(self):
@@ -137,6 +140,10 @@ class auv_pf(object):
         self.draper.set_ray_tracing_enabled(False)            
         print("draper created")
  
+        # Load GP
+        gp_path = rospy.get_param("~gp_path", 'gp.path')
+        self.gp = gp.SVGP.load(500, gp_path)
+
         # Action server for MBES pings sim (necessary to be able to use UFO maps as well)
         self.as_ping = actionlib.SimpleActionServer('/mbes_sim_server', MbesSimAction, 
                                                     execute_cb=self.mbes_as_cb)
@@ -157,7 +164,69 @@ class auv_pf(object):
         self.update_rviz()
         rospy.spin()
 
-    
+    def gp_sampling(self, p, R):
+        h = 80. # Depth of the field of view
+        b = h * np.cos(self.mbes_angle/2.)
+        n = 60  # Number of sampling points
+
+        # Triangle vertices 
+        Rxmin = rotation_matrix(-self.mbes_angle/2., (1,0,0))[0:3, 0:3]
+        Rxmax = rotation_matrix(self.mbes_angle/2., (1,0,0))[0:3, 0:3]
+        Rxmin = np.matmul(R, Rxmin)
+        Rxmax = np.matmul(R, Rxmax)
+        
+        p2 = p + Rxmax[:,2]/np.linalg.norm(Rxmax[:,2]) * b
+        p3 = p + Rxmin[:,2]/np.linalg.norm(Rxmin[:,2]) * b
+        
+        # Sampling step
+        i_range = np.linalg.norm(p3 - p2)/n
+
+        # Across ping direction
+        direc = ((p3-p2)/np.linalg.norm(p3-p2)) 
+        sampling_points = []
+        for i in range(0, n):
+            sampling_points.append(p2 + direc * i_range * i)
+
+        # Sample GP here
+        mu, sigma = self.gp.sample(np.asarray(sampling_points)[:, 0:2])
+        mu_array = np.array([mu])
+        
+        # Concatenate sampling points x,y with sampled z
+        mbes_gp = np.concatenate((np.asarray(sampling_points)[:, 0:2], 
+                                  mu_array.T), axis=1)
+        #  print(mbes_gp)
+        return mbes_gp
+
+
+    def gp_ray_tracing(self, r_mbes, p, gp_samples, beams_num):
+
+        # Transform points to MBES frame to perform ray tracing on 2D
+        rot_inv = r_mbes.transpose()
+        p_inv = rot_inv.dot(p)
+        gp_samples = [rot_inv.dot(beam) - p_inv for beam in gp_samples]
+        
+        # TODO: this can be faster
+        exp_meas = []
+        for m in range(0, len(self.beams_dir)):
+            # No need to iterate over all the points for each beam
+            for i in range(1, len(gp_samples)):
+                v1 = -gp_samples[i-1]
+                v2 = gp_samples[i] - gp_samples[i-1]
+                v3 = [self.beams_dir[m][0], -self.beams_dir[m][2], self.beams_dir[m][1]]
+
+                t1 = np.linalg.norm(np.cross(v2, v1))/v2.dot(v3)
+                if (t1 > 0):
+                    t2 = v1.dot(v3)/v2.dot(v3)
+                    if(t2 > 0 and t2 < 1):
+                        exp_meas.append(self.beams_dir[m] * t1)
+                        break
+        
+        # Transform back to map frame
+        mbes_gp = np.asarray(exp_meas)
+        mbes_gp = [r_mbes.dot(beam) + p for beam in mbes_gp]
+
+        return mbes_gp
+
     def mbes_real_cb(self, msg):
         self.latest_mbes = msg
 
@@ -214,7 +283,7 @@ class auv_pf(object):
     def update(self, real_mbes, odom):
         # Compute AUV MBES ping ranges
         real_mbes_ranges = pcloud2ranges(real_mbes)
-        #  real_mbes_ranges = gaussian_filter1d(real_mbes_ranges , sigma=10)
+        real_mbes_ranges = gaussian_filter1d(real_mbes_ranges , sigma=4)
         
         # The sensor frame on IGL needs to have the z axis pointing opposite from the actual 
         # sensor direction
@@ -227,7 +296,13 @@ class auv_pf(object):
             # Compute base_frame from mbes_frame
             p_part, r_mbes = self.particles[i].get_p_mbes_pose();
             r_base = r_mbes.dot(R) # The GP sampling uses the base_link 
-                               
+            
+            # Sample GP points
+            #  gp_samples = self.gp_sampling(p_part, r_base)
+#
+            #  # Perform raytracing over segments between GP sampled points
+            #  exp_mbes = self.gp_ray_tracing(r_mbes, p_part, gp_samples, self.beams_num)
+                   
             # MBES sim on IGL
             exp_mbes = self.draper.project_mbes(np.asarray(p_part), r_mbes.dot(R_flip),
                                                 self.beams_num, self.mbes_angle)
@@ -264,7 +339,7 @@ class auv_pf(object):
         #  print "-------------"
         # Normalize weights
         weights /= weights.sum()
-        print (weights)
+        #  print (weights)
 
         N_eff = self.pc
         if weights.sum() == 0.:
