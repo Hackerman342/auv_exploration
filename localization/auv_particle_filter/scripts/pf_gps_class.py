@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+"""
+CURRENTLY UNUSED
+ALL FUNCTIONS MOVED TO pf_GP_functions.py
+"""
+
 import numpy as np
 from auvlib.data_tools import gsf_data, std_data, csv_data, xyz_data
 from auvlib.bathy_maps import mesh_map, base_draper
@@ -41,8 +46,8 @@ class GP_mbes:
     # ---------------------------------------------------------------------
 
     def __init__(self, mbes_meas_ranges, sim_meas_ranges):
-        self.mbes_meas_ranges = mbes_meas_ranges  
-        self.sim_meas_ranges = sim_meas_ranges 
+        self.mbes_meas_ranges = mbes_meas_ranges
+        self.sim_meas_ranges = sim_meas_ranges
 
     def Training_data(self):
         # Beams distributed along seafloor - AUV's y axis
@@ -53,7 +58,7 @@ class GP_mbes:
         self.train_y_sim = torch.Tensor(self.sim_meas_ranges)
 
     # Run regression (all lumped into one function for now)
-    def run_gpytorch_regression(self, train_x, train_y): 
+    def run_gpytorch_regression(self, train_x, train_y):
         """
         Run regression (all lumped into one function for now)
         """
@@ -63,18 +68,12 @@ class GP_mbes:
 
         # -------------- Constants ------------------------------------:
         training_point_count = 15
-        max_training_iter_count = 300
+        max_train_iter = 300
         noise_threshold = 0.01 # Use noise to determine when to stop training
-        loss_threshold = -2.0
         # -------------------------------------------------------------
         # initialize likelihood and model
         likelihood = gpytorch.likelihoods.GaussianLikelihood()
         model = ExactGPModel(train_x, train_y, likelihood)
-
-        # this is for running the notebook in our testing framework
-        import os
-        smoke_test = ('CI' in os.environ)
-        max_train_iter = 2 if smoke_test else max_training_iter_count
 
         # Find optimal model hyperparameters
         model.train()
@@ -87,7 +86,6 @@ class GP_mbes:
         mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
         i = 0 # init iteration count
-        loss_val = 999. # init loss value for convergence w/ large value
 
         # Train until convergence
         # while loss_val >= loss_threshold:
@@ -119,7 +117,7 @@ class GP_mbes:
 
         # Test points are regularly spaced on range of y-axis
         # Make predictions by feeding model through likelihood
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():  # To use LOVE 
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():  # To use LOVE
             test_x = torch.linspace(min(train_x), max(train_x), training_point_count)
             observed_pred = likelihood(model(test_x))
 
@@ -141,8 +139,8 @@ class GP_mbes:
         # print('\ndet(cov_sim):  {}'.format(np.linalg.det(cov_sim)))
         # print(  'det(cov_mbes): {}'.format(np.linalg.det(cov_mbes)))
 
-        def is_pos_semi_def(x):
-            return np.all(np.linalg.eigvals(x) >= 0)
+        # def is_pos_semi_def(x):
+        #     return np.all(np.linalg.eigvals(x) >= 0)
 
         # print("\nPositive semi-def check: cov_sim: ",  is_pos_semi_def(cov_sim))
         # print(  "Positive semi-def check: cov_mbes: ", is_pos_semi_def(cov_mbes))

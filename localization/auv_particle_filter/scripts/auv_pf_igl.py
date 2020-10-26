@@ -33,6 +33,9 @@ from auvlib.data_tools import csv_data
 
 from scipy.ndimage.filters import gaussian_filter
 
+# For Gaussian Process weights
+from pf_GP_functions import mbes_gpytorch_regression
+
 class auv_pf(object):
 
     def __init__(self):
@@ -45,6 +48,7 @@ class auv_pf(object):
         self.beams_num = rospy.get_param("~num_beams_sim", 20)
         self.beams_real = rospy.get_param("~n_beams_mbes", 512)
         self.mbes_angle = rospy.get_param("~mbes_open_angle", np.pi/180. * 60.)
+        self.use_GP_weights = rospy.get_param('~use_GP_weights', False) # Gaussian Processes require different setup
 
         # Initialize tf listener
         tfBuffer = tf2_ros.Buffer()
@@ -122,29 +126,29 @@ class auv_pf(object):
 
         mbes_pc_top = rospy.get_param("~particle_sim_mbes_topic", '/sim_mbes')
         self.pcloud_pub = rospy.Publisher(mbes_pc_top, PointCloud2, queue_size=10)
-        
+
         # Load mesh
         print("Loading data")
         svp_path = rospy.get_param('~sound_velocity_prof')
         mesh_path = rospy.get_param('~mesh_path')
         sound_speeds = csv_data.csv_asvp_sound_speed.parse_file(svp_path)
         data = np.load(mesh_path)
-        V, F, bounds = data['V'], data['F'], data['bounds'] 
+        V, F, bounds = data['V'], data['F'], data['bounds']
         print("Mesh loaded")
 
         # Create draper
         self.draper = base_draper.BaseDraper(V, F, bounds, sound_speeds)
-        self.draper.set_ray_tracing_enabled(False)            
+        self.draper.set_ray_tracing_enabled(False)
         print("draper created")
- 
+
         # Action server for MBES pings sim (necessary to be able to use UFO maps as well)
-        self.as_ping = actionlib.SimpleActionServer('/mbes_sim_server', MbesSimAction, 
+        self.as_ping = actionlib.SimpleActionServer('/mbes_sim_server', MbesSimAction,
                                                     execute_cb=self.mbes_as_cb)
 
-        # Subscription to real mbes pings 
+        # Subscription to real mbes pings
         mbes_pings_top = rospy.get_param("~mbes_pings_topic", 'mbes_pings')
         rospy.Subscriber(mbes_pings_top, PointCloud2, self.mbes_real_cb)
-        
+
         # Create expected MBES beams directions
         angle_step = self.mbes_angle/self.beams_num
         self.beams_dir = []
@@ -157,7 +161,7 @@ class auv_pf(object):
         self.update_rviz()
         rospy.spin()
 
-    
+
     def mbes_real_cb(self, msg):
         self.latest_mbes = msg
 
@@ -165,41 +169,41 @@ class auv_pf(object):
     def mbes_as_cb(self, goal):
 
         # Unpack goal
-        p_auv = [goal.mbes_pose.transform.translation.x, 
-                 goal.mbes_pose.transform.translation.y, 
+        p_auv = [goal.mbes_pose.transform.translation.x,
+                 goal.mbes_pose.transform.translation.y,
                  goal.mbes_pose.transform.translation.z]
         r_mbes = quaternion_matrix([goal.mbes_pose.transform.rotation.x,
                                     goal.mbes_pose.transform.rotation.y,
                                     goal.mbes_pose.transform.rotation.z,
                                     goal.mbes_pose.transform.rotation.w])[0:3, 0:3]
-                
+
         # IGL sim ping
         # The sensor frame on IGL needs to have the z axis pointing opposite from the actual sensor direction
         R_flip = rotation_matrix(np.pi, (1,0,0))[0:3, 0:3]
         mbes = self.draper.project_mbes(np.asarray(p_auv), r_mbes.dot(R_flip),
                                         goal.beams_num.data, self.mbes_angle)
-        
+
         mbes = mbes[::-1] # Reverse beams for same order as real pings
-        
+
         # Pack result
         mbes_cloud = pack_cloud(self.map_frame, mbes)
         result = MbesSimResult()
         result.sim_mbes = mbes_cloud
         self.as_ping.set_succeeded(result)
 
-        self.latest_mbes = result.sim_mbes 
+        self.latest_mbes = result.sim_mbes
 
     def odom_callback(self, odom_msg):
         self.time = odom_msg.header.stamp.to_sec()
         if self.old_time and self.time > self.old_time:
             # Motion prediction
-            self.predict(odom_msg)    
-            
-            if self.latest_mbes.header.stamp > self.prev_mbes.header.stamp:    
+            self.predict(odom_msg)
+
+            if self.latest_mbes.header.stamp > self.prev_mbes.header.stamp:
                 # Measurement update if new one received
                 weights = self.update(self.latest_mbes, odom_msg)
                 self.prev_mbes = self.latest_mbes
-                
+
                 # Particle resampling
                 self.resample(weights)
 
@@ -215,19 +219,24 @@ class auv_pf(object):
         # Compute AUV MBES ping ranges
         real_mbes_ranges = pcloud2ranges(real_mbes)
         #  real_mbes_ranges = gaussian_filter1d(real_mbes_ranges , sigma=10)
-        
-        # The sensor frame on IGL needs to have the z axis pointing opposite from the actual 
+
+        if self.use_GP_weights:
+            # Train a GP on the real mbes measurement
+            print("\nTraining GP on real mbes measurement")
+            real_mbes_GP_pred = mbes_gpytorch_regression(real_mbes_ranges)
+
+        # The sensor frame on IGL needs to have the z axis pointing opposite from the actual
         # sensor direction
         R_flip = rotation_matrix(np.pi, (1,0,0))[0:3, 0:3]
-        
+
         # To transform from base to mbes
         R = self.base2mbes_mat.transpose()[0:3,0:3]
         # Measurement update of each particle
         for i in range(0, self.pc):
             # Compute base_frame from mbes_frame
-            p_part, r_mbes = self.particles[i].get_p_mbes_pose();
-            r_base = r_mbes.dot(R) # The GP sampling uses the base_link 
-                               
+            p_part, r_mbes = self.particles[i].get_p_mbes_pose()
+            r_base = r_mbes.dot(R) # The GP sampling uses the base_link
+
             # MBES sim on IGL
             exp_mbes = self.draper.project_mbes(np.asarray(p_part), r_mbes.dot(R_flip),
                                                 self.beams_num, self.mbes_angle)
@@ -237,8 +246,11 @@ class auv_pf(object):
             mbes_pcloud = pack_cloud(self.map_frame, exp_mbes)
             self.pcloud_pub.publish(mbes_pcloud)
 
-            self.particles[i].compute_weight(exp_mbes, real_mbes_ranges, True)
-        
+            if self.use_GP_weights:
+                self.particles[i].compute_GP_weight(exp_mbes, real_mbes_ranges, real_mbes_GP_pred, True)
+            else:
+                self.particles[i].compute_weight(exp_mbes, real_mbes_ranges, True)
+
         weights = []
         for i in range(self.pc):
             weights.append(self.particles[i].w)
@@ -253,10 +265,10 @@ class auv_pf(object):
     def ping2ranges(self, point_cloud):
         ranges = []
         cnt = 0
-        for p in pc2.read_points(point_cloud, 
+        for p in pc2.read_points(point_cloud,
                                  field_names = ("x", "y", "z"), skip_nans=True):
             ranges.append(np.linalg.norm(p[-2:]))
-        
+
         return np.asarray(ranges)
 
     def resample(self, weights):
@@ -275,8 +287,8 @@ class auv_pf(object):
         print ("N_eff ", N_eff)
         #  print "Missed meas ", self.miss_meas
         if self.miss_meas < self.pc/2.:
-            self.stats.publish(np.float32(N_eff)) 
-        
+            self.stats.publish(np.float32(N_eff))
+
         # Resampling?
         if N_eff < self.pc/2. and self.miss_meas < self.pc/2.:
             indices = stratified_resample(weights)
@@ -312,11 +324,11 @@ class auv_pf(object):
         roll  = ave_pose[3]
         pitch = ave_pose[4]
 
-        # Wrap up yaw between -pi and pi        
-        poses_array[:,5] = [(yaw + np.pi) % (2 * np.pi) - np.pi 
+        # Wrap up yaw between -pi and pi
+        poses_array[:,5] = [(yaw + np.pi) % (2 * np.pi) - np.pi
                              for yaw in  poses_array[:,5]]
         yaw = np.mean(poses_array[:,5])
-        
+
         self.avg_pose.pose.pose.orientation = Quaternion(*quaternion_from_euler(roll,
                                                                                 pitch,
                                                                                 yaw))

@@ -24,9 +24,10 @@ from std_msgs.msg import Header
 from sensor_msgs import point_cloud2
 
 # For the gp weight
-from pf_gps_class import GP_mbes as GP
-import time
-
+# from pf_gps_class import GP_mbes as GP
+# import time
+# For Gaussian Process weights
+from pf_GP_functions import mbes_gpytorch_regression, KLgp_div
 
 class Particle(object):
     def __init__(self, beams_num, p_num, index, mbes_tf_matrix, m2o_matrix,
@@ -86,7 +87,7 @@ class Particle(object):
 
     def compute_weight(self, exp_mbes, real_mbes_ranges, got_result):
         if got_result:
-            # Predict mbes ping given current particle pose and m 
+            # Predict mbes ping given current particle pose and m
             exp_mbes_ranges = self.list2ranges(exp_mbes)
 
             if len(exp_mbes_ranges) > 0:
@@ -94,17 +95,14 @@ class Particle(object):
                 idx = np.round(np.linspace(0, len(real_mbes_ranges) - 1,
                                            self.beams_num)).astype(int)
                 mbes_meas_sampled = real_mbes_ranges[idx]
-                
+
                 # For debugging
                 #  print (len(exp_mbes_ranges))
                 #  print (len(mbes_meas_sampled))
                 #  print (exp_mbes_ranges)
                 #  print (mbes_meas_sampled)
                 #  print (exp_mbes_ranges - mbes_meas_sampled)
-
-                # Update particle weights
-                self.w = self.weight_gps(mbes_meas_sampled, exp_mbes_ranges)
-                # self.w = self.weight_mv(mbes_meas_sampled, exp_mbes_ranges)
+                self.w = self.weight_mv(mbes_meas_sampled, exp_mbes_ranges)
                 #  print "MV ", self.w
                 #  self.w = self.weight_avg(mbes_meas_sampled, exp_mbes_ranges)
                 #  print "Avg ", self.w
@@ -116,6 +114,24 @@ class Particle(object):
             #  rospy.logwarn("Particle did not get meas")
             self.w = 1.e-50
 
+    def compute_GP_weight(self, exp_mbes, real_mbes_ranges, real_mbes_GP_pred, got_result):
+        if got_result:
+            # Predict mbes ping given current particle pose and m
+            exp_mbes_ranges = self.list2ranges(exp_mbes)
+
+            if len(exp_mbes_ranges) > 0:
+                # Before calculating weights, make sure both meas have same length
+                idx = np.round(np.linspace(0, len(exp_mbes_ranges) - 1,
+                                            len(real_mbes_ranges))).astype(int)
+                mbes_sim_sampled = exp_mbes_ranges[idx]
+
+                self.w = self.weight_gps(real_mbes_ranges, mbes_sim_sampled, real_mbes_GP_pred)
+
+            else:
+                self.w = 1.e-50
+        else:
+            #  rospy.logwarn("Particle did not get meas")
+            self.w = 1.e-50
 
     def weight_grad(self, mbes_meas_ranges, mbes_sim_ranges ):
         if len(mbes_meas_ranges) == len(mbes_sim_ranges):
@@ -128,23 +144,26 @@ class Particle(object):
             w_i = 1.e-50
         return w_i
 
-    def weight_gps(self, mbes_meas_ranges, mbes_sim_ranges):
-        time_start = time.time()
-        tmp_Ping = GP(mbes_meas_ranges, mbes_sim_ranges) # Create a gp object
-        # Getting training data
-        tmp_Ping.Training_data()
-        # Run gpytorch regression on real data
-        train_mbes_start = time.time()
-        tmp_Ping.test_x_mbes, tmp_Ping.observed_pred_mbes = tmp_Ping.run_gpytorch_regression(tmp_Ping.train_x_mbes, tmp_Ping.train_y_mbes)
-        print("\n MBES train time (s): ", time.time() - train_mbes_start, "\n")
-        # Run gpytorch regression on sim data
-        train_sim_start = time.time()
-        tmp_Ping.test_x_sim, tmp_Ping.observed_pred_sim = tmp_Ping.run_gpytorch_regression(tmp_Ping.train_x_sim, tmp_Ping.train_y_sim)
-        print("\n sim train time (s): ", time.time() - train_sim_start, "\n")
-        # Calculate KL divergence
-        w_i = tmp_Ping.KLgp_div()
-        print("\n Total ping time (s): ", time.time() - time_start, "\n")
-        print('\n gp weight: {}'.format(w_i, precision=3))
+    def weight_gps(self, mbes_meas_ranges, mbes_sim_ranges, real_mbes_GP_pred):
+        if len(mbes_meas_ranges) == len(mbes_sim_ranges): # Double safety check
+
+            # time_start = time.time()
+
+            # Run gpytorch regression on sim data
+            print("\nTraining GP on particle: ", self.index)
+            observed_pred_sim = mbes_gpytorch_regression(mbes_sim_ranges)
+            # print("\nsim train time (s): ", time.time() - train_sim_start, "\n")
+
+            # Calculate KL divergence
+            kl_div = KLgp_div(real_mbes_GP_pred, observed_pred_sim)
+            w_i = 1. / kl_div
+
+            # print("\nTotal weight time (s): ", time.time() - time_start, "\n")
+            print('kl_div:    {}'.format(kl_div, precision=3))
+            print('gp weight: {}'.format(w_i, precision=3))
+        else:
+            rospy.logwarn("missing pings!")
+            w_i = 1.e-50
 
         return w_i
 
@@ -158,7 +177,7 @@ class Particle(object):
             rospy.logwarn("missing pings!")
             w_i = 1.e-50
         return w_i
-      
+
     def weight_avg(self, mbes_meas_ranges, mbes_sim_ranges ):
         if len(mbes_meas_ranges) == len(mbes_sim_ranges):
             #  w_i = 1./self.p_num
@@ -170,20 +189,20 @@ class Particle(object):
             #  w_i = 1./self.p_num
             w_i = 1.e-50
         return w_i
-    
+
     def get_p_mbes_pose(self):
-        # Find particle's mbes_frame pose 
+        # Find particle's mbes_frame pose
         t_particle = translation_matrix(self.p_pose[0:3])
         r_particle = rot.from_euler('xyz', self.p_pose[3:6], degrees=False)
         q_particle = quaternion_matrix(r_particle.as_quat())
         mat = np.dot(t_particle, q_particle)
-        
+
         trans_mat = self.m2o_tf_mat.dot(mat.dot(self.mbes_tf_mat))
 
         self.p = translation_from_matrix(trans_mat)
         angle, direc, point = rotation_from_matrix(trans_mat)
         self.R = rotation_matrix(angle, direc, point)[0:3, 0:3]
-        
+
         return (self.p, self.R)
 
     # Extract the z coordinate from exp pings (in map frame)
@@ -194,17 +213,17 @@ class Particle(object):
 
         return np.asarray(ranges)
 
-    
+
 # Extract the z coordinate from real pings (in map frame)
 def pcloud2ranges(point_cloud):
     ranges = []
-    for p in pc2.read_points(point_cloud, 
+    for p in pc2.read_points(point_cloud,
                              field_names = ("x", "y", "z"), skip_nans=True):
         ranges.append(p[2])
 
     return np.asarray(ranges)
 
-# Create PointCloud2 msg out of ping    
+# Create PointCloud2 msg out of ping
 def pack_cloud(frame, mbes):
     mbes_pcloud = PointCloud2()
     header = Header()
@@ -216,7 +235,7 @@ def pack_cloud(frame, mbes):
 
     mbes_pcloud = point_cloud2.create_cloud(header, fields, mbes)
 
-    return mbes_pcloud 
+    return mbes_pcloud
 
 
 def matrix_from_tf(transform):
