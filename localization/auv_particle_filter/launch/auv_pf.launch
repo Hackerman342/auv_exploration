@@ -7,7 +7,7 @@
   <arg name="n_beams_mbes" default="1"/>
   <arg name="mbes_open_angle" default="1.5708"/>
 	<arg name="namespace" default="auv"/>
-  <arg name="use_GP_weights" default="True"/> <!-- bool -->
+  <arg name="use_GP_weights" default="False"/> <!-- bool -->
 
   <!-- Define args -->
   <arg name="particle_count"                    default="10"/>
